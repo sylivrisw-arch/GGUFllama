@@ -1,0 +1,280 @@
+# GGUFengine — Feature & Upgrade History
+
+GGUFengine ("Simple Chat") is a lightweight, single-file Tkinter app that runs `.gguf` models in-process through llama.cpp, supporting single-model chat and two-model Discussion mode. The main script is `GGUFllama.py` (~7,900 lines). It is now one self-contained script: the Constraint Engine, the llama.cpp backend, the HTTP API, the Block Editor, and the Drawing, Music and Images windows are all built in. LM Studio is no longer a backend (see section 11).
+
+This document walks through its features **in build order**: the original stable baseline, the dual-backend era and its follow-up upgrades (RAM spillover, GPT-OSS/Qwen output handling, unload-cancels-generation, reasoning controls), the optional HTTP API, and then the most recent round: the Block Editor moved inside the app (and grew), the LM Studio backend removal, the Terminator persona with spoken replies, the new model chip menu under the input box, and the Drawing, Music and Images windows. It ends with what's still on the backlog and known bugs.
+
+*Updated against the current `GGUFllama.py`. Sections 1-10 describe the app as it was built and are kept as history; where a later section changed something (e.g. LM Studio, Connect), the later section wins.*
+
+---
+
+## Timeline (oldest → newest)
+
+### 1. Foundation — Stable Baseline
+Two windows that have stayed untouched since the start:
+
+- **Prompts window** — plain, read-only reference panel. Left sidebar lists 7 roles; right pane shows the full prompt text for whichever role is selected. Non-editable, and disconnected from the Chat and Discussion pipelines by design.
+- **Notes window** — memory-only storage (`app.notes_text`). Notes reset when the app closes but persist for the duration of a run.
+
+---
+
+### 2. Early Upgrades — Connection, Streaming, Notes Loading
+- **Server Connection status** — explicit red/green indicator. Red + "Disconnected" at launch before Connect is pressed; green + "Connected" shows the loaded model name once active.
+- **Connect flow** — pressing Connect fires `GET /v1/models` to verify reachability, then auto-fetches the full model catalog via `GET /api/v1/models`.
+- **Streaming chat** — chat requests moved to streaming (`stream: true`, `include_usage: true`, `temperature 0.7`); token counter now updates from the final SSE chunk's usage object.
+- **Live `<think>...</think>` parsing** — correctly handles think-tags across chunk boundaries, rendering them as a separate, muted "Thinking" block ahead of the response.
+- **Notes Load...** — added alongside existing Save...: opens a `.txt` file picker (folder-aware starting location) and fully replaces the notepad's content. Manual only — no auto-load on window or app launch.
+
+---
+
+### 3. Models Window Upgrades
+- **Auto-population** — catalog now fetches automatically after a successful Connect; old manual "Load LMs" refresh button removed.
+- **Sorting & sync** — models sorted largest-to-smallest by size; load state synced in real time via `mark_unloaded()` / `mark_reloaded()`.
+- **Right-click context menu** — gained read-only info rows for Context length and Location (model file path), plus always-visible Load/Unload buttons that grey out when inapplicable. New "Reload model" option unloads then reloads the model at its current context length.
+- **Loading triggers** — double-click, or right-click → "Load model". Loading a plain-chat model always evicts the other plain-chat model, and sets `app.server_model` / `instance_id` for chat calls. Unloading is right-click → "Unload model" only — no click-based unload trigger.
+- **Discussion mode support** — right-click gained "Set as Discussion A/B" and "Clear discussion role". Loading a model as A or B is additive (doesn't evict the other plain-chat model), and A/B models are protected from auto-eviction. Loaded discussion models display ♦ Discussion A/B in their slot color.
+- **Unloading a discussion model** — now clears its assigned role and triggers `on_discussion_models_changed` to keep the main window in sync.
+
+---
+
+### 4. Auto-Max Context
+- New toggle: **"Auto-max context for all models"** on the main window.
+- Enabling it spins up a background thread that unloads and reloads each currently loaded model at its server catalog's maximum context length.
+- From then on, any future load — whether from the Models window or through a Discussion A/B assignment — automatically uses max context instead of the saved per-model setting.
+- Operates independently of whether the Models window is open or closed.
+- If a reload fails, that model is marked unloaded and any chat/discussion links to it are cleared.
+
+---
+
+### 5. Discussion Mode
+A second conversation mode introduced alongside Chat, toggled via 🗗 / 🗣 buttons. Requires both Discussion A and B models to be assigned and loaded at the same time.
+
+- A discussion starts with the user's typed topic as the first "user" message in both models' private histories; each model treats itself as "assistant".
+- The two models alternate turns in a loop, reusing the same streaming pipeline, and keep going until Stop is pressed or a request fails.
+- An **interjection queue** lets the user type messages during an active discussion — queued and inserted into both histories once the current reply finishes.
+- **Stop button** — finishes the in-flight reply, appends "Discussion stopped" to the log, and leaves both models loaded.
+- A status label shows `A: <name>    B: <name>`, or a red prompt if a slot is missing. The discussion auto-stops if the server reports a discussion model was unloaded mid-run.
+
+---
+
+### 6. Main Window Layout Reorganization
+Layout reorganized top-to-bottom, left-aligned:
+
+1. Title row — just the "Simple Chat" heading.
+2. Button row — 🖥 Models, 📖 Prompts, 📝 Notes, 🆔 New Chat, 🧩 Simple Mode (all green); old Knowledge button removed.
+3. Constraints Engine toggle (▾ Hide / ▸ Show).
+4. Constraints Engine card.
+5. Mode row — 💬 Chat / 🗣 Discussion, with a right-aligned status label shown only in Discussion mode.
+6. Sub-header — "Tokens: N" plus the optional discussion status label.
+
+Also added:
+- Red **Stop button**, visible only during an active discussion (calls `stop_discussion()`).
+- Updated chat log rendering — distinct tags/colors for You, Assistant, and Discussion A/B.
+- Inline, muted/italic/indented "Thinking" blocks for streamed thoughts.
+- New **New Chat button** — clears `app.conversation`, resets the token counter to 0, wipes the chat log, without unloading the server model. Greyed out during streaming or an active discussion.
+
+---
+
+### 7. Save Locations
+- New **"Save Locations"** option added to the title-bar right-click menu, opening a session-only folder configuration modal on boot or on menu re-open.
+- Leaving it blank, or canceling, preserves whatever setting already existed (or leaves none set).
+- Feeds a shared save helper meant for every future Save... action: if a folder is configured, it prompts only for a filename and writes to `<folder>/<name>`; if no folder is set, it falls back to the OS's native Save As dialog.
+
+---
+
+### 8. Simple Mode
+- New button in the main window row collapses the interface into **Simple Mode** — hides the title, all buttons (including itself), the Constraints Engine toggle/card, the mode row, and the token sub-header, leaving only the chat log and input box.
+- Exiting restores everything, including re-expanding the Constraints Engine if it had been manually hidden before.
+- Purely visual and non-destructive: server connection, loaded models, Discussion pairings, and any in-flight discussion all continue unchanged; Send/Stop stay accessible throughout.
+
+---
+
+### 9. Constraints Engine Overhaul
+- Architecture fully merged into `GGUFengine.py`, no separate local file dependency.
+- Lives in a collapsible card with a right-aligned toggle button above it, structured as: Title/status → Enabled checkbox + buttons → Server row (moved into the card) → checkboxes for Auto-max / Unload after reply (also moved into the card).
+- Checking **Enabled** builds a fresh `ConstraintEngine()` with zero active constraints — every constraint has to be manually turned on each session via Edit Engine, and the checkbox reverts and throws an error if construction fails.
+- **Edit Engine overhauled** — no longer opens an external GUI. Now opens an in-app Toplevel listing all 22 constraints (15 separate, 7 collective) as simple on/off checkboxes, with no parameter fields or JSON config loader — checking/unchecking instantly adds or removes the constraint from the live engine. All session-only, resets to empty/disabled on next launch.
+- Edit Engine and Test Engine buttons now colored orange.
+- Legacy lmengine artifacts removed: per-role token-limit row, "Auto load/unload models" checkbox, "Open Config" button, "View Cache" button.
+- **Engine hardening** (inside the embedded engine, no UI change):
+  - `NoDoubleSpaces` only collapses runs of spaces in ordinary prose. It leaves leading indentation, fenced code blocks (``` or ~~~, an unclosed fence protects the rest) and inline `code` spans alone; `validate()` means "collapsing would change nothing", so it can't disagree with `fix()`.
+  - `validate()` treats a constraint that raises as failed (with an error) instead of crashing the caller, and on failure returns the partially fixed text. After a pass that fixed something, all constraints are re-checked (up to 3 rounds) since one fix can undo another, so "success" means the final text really passes everything.
+  - The validation cache key includes a fingerprint of the active constraint set and its parameters, so a result cached under one set is never served to another. The cache is capped at 500 entries and skips inputs over 20,000 characters. It is stored on disk as `lm_constraint_cache.json` in a `constraint_engine_data` folder next to the script (the constraint on/off choices themselves are still session-only).
+
+---
+
+### 10. Chat Log Right-Click Menu
+- Chat log gained a right-click context menu (**Copy / Highlighted Text Count / Export to Notes**), bound once so it works identically in Simple Mode and normal mode, and in both Chat and Discussion.
+- **Copy** and **Highlighted Text Count** are enabled only when text is selected; Highlighted Text Count shows a character-count popup for the current selection.
+- **Export to Notes** appends the text of the last assistant response to the Notes window's content — writing straight into an already-open Notes window live, or into the stored notepad text if Notes isn't currently open.
+
+---
+
+### 11. Dual Backend — Local (llama.cpp) Inference  *(LM Studio half since removed)*
+The app first moved from LM-Studio-only to **two interchangeable inference sources** behind a common five-call interface, then later dropped LM Studio entirely. The history, and what survived:
+
+- **What was built:** a backend interface (`connect` / `fetch_catalog` / `load_model` / `unload_model` / `stream_chat` / `disconnect`) with identical catalog and load-result shapes, so the Models window, Auto-Max Context, Discussion mode and Send never knew which backend they were talking to. A "LM Studio" / "Local (GPU)" toggle picked between them.
+- **Current state: single backend.** The LM Studio backend, the backend toggle and all `/v1/models` / `/api/v1/models` HTTP code are gone. `self.backend` is always `LocalLlamaBackend`; if `llama-cpp-python` isn't installed the app still opens but Connect is refused with a message. The module docstring now describes it as a dual-layer/local-only app with no server and no network hop. The interface is kept, so a second backend could be slotted back in.
+- **Connect is now "Authenticate".** The Server-row button reads Authenticate (it just checks the models folder exists); the red/green dot + "Disconnected"/"Connected" label are unchanged. Disconnect (unload every model, free GPU/CPU buffers, stop any discussion first) still exists as `disconnect_server`.
+- **Local backend (unchanged core):** runs `.gguf` files via `llama-cpp-python` with `Llama(n_gpu_layers=-1)`; the "catalog" is a recursive folder scan; load builds the `Llama`, unload frees it.
+- **Local Models Folder** (title-bar right-click menu) points the backend at a folder of `.gguf` files; defaults to `~/.lmstudio/models` so it can still share files with LM Studio. Change takes effect on the next Authenticate.
+- **Metadata:** quantization and parameter count are best-effort filename guesses; max context length comes from a fast `vocab_only` probe load cached by path+size.
+- **VRAM guard:** estimates file size + rough KV cache + fixed overhead against a configured VRAM budget (RTX 5060 Laptop GPU, with a safety margin) and refuses to load what won't fit, naming the shortfall. (Section 12's spillover mode bypasses the refusal.)
+- **Streaming contract:** `stream_chat` yields `(delta, finish_reason, usage)`; since llama-cpp-python emits no usage chunk, token counts are computed afterwards with the model's tokenizer.
+- **Pinned-version note (Models window):** a warning banner explains that llama-cpp-python is pinned to a fixed version because upgrading has been unreliable, so newer quantization formats (e.g. MXFP4) fail to load until it's upgraded. *With LM Studio gone, the banner's old workaround ("these still load fine via the LM Studio backend") no longer applies inside this app.*
+
+---
+
+### 12. RAM Spillover (Local Backend)
+Lets a model that's bigger than VRAM load anyway by splitting its layers between the GPU and system RAM, instead of being refused by the VRAM guard.
+
+- New **"Allow RAM spillover (Local)"** checkbox plus a **GPU layers** setting (Auto = 0). *Originally in the Server card; both now live in the model chip menu (section 18), where GPU layers opens a slider dialog and is only enabled while spillover is ticked.* Session-only.
+- **Checkbox off** — behaves as before: `n_gpu_layers=-1` and the VRAM guard. The refusal message now also suggests ticking the spillover box.
+- **Checkbox on** — the guard never refuses. The backend reads the model's layer count (`<arch>.block_count`) from the same fast `vocab_only` probe used for max context (cached alongside it), then:
+  - if weights + KV cache + overhead fit in the remaining VRAM budget → `n_gpu_layers=-1` (everything on GPU);
+  - otherwise → offloads as many layers as fit and runs the rest from system RAM. KV cache is treated as offloading per layer, so weights and KV are both scaled by the fraction of layers on the GPU.
+- **Manual override** — a number in "GPU layers" is used directly instead of the calculation (`-1` = all on GPU).
+- If the model doesn't fit and its layer count can't be read, the load fails with a message asking for a manual layer count rather than crashing.
+- The VRAM tally for each loaded model is scaled to the offloaded fraction, and the load result now carries `gpu_layers`.
+- Worth knowing: Auto-max context inflates the KV cache, which pushes the auto layer count down and slows loads — turn it off for big spilled models if replies are slow.
+
+---
+
+### 13. Output Parsing — GPT-OSS (Harmony) and Qwen (Implicit `<think>`)
+`llama-cpp-python` returns raw text, so two model families needed their thinking format translated for the existing chat pipeline. Both are handled inside `LocalLlamaBackend.stream_chat`, so nothing downstream changed.
+
+- **GPT-OSS / harmony format** — the model writes `<|channel|>analysis<|message|>…<|end|><|start|>assistant<|channel|>final<|message|>…`, which used to appear verbatim in the reply. A new `HarmonyStreamFilter` turns the stream into two kinds of text: the analysis/commentary channels go to the muted "Thinking" block (as `reasoning_content`), the final channel goes to the "Assistant" reply, and all control tokens are dropped. It buffers partial tokens split across chunks. Only the final answer is saved to conversation history.
+- **Qwen3/3.5 implicit `<think>`** — their chat template already ends the prompt with `<think>\n`, so the model only ever emits the closing `</think>` and the whole reasoning was showing up as the answer. The backend now detects this from the chat template and sends an opening `<think>\n` first, so the existing think-tag parser sees a balanced block (LM Studio does the same thing on its side).
+- Models that use neither format pass through unchanged.
+
+---
+
+### 14. Unload Cancels an In-Flight Reply (Local Backend)
+Previously, unloading a Local model mid-reply left it generating: the reply thread held its own reference to the model, so dropping the app's reference neither stopped generation nor freed the VRAM.
+
+- Each loaded model handle now carries a **cancel flag** and a **generation lock**. `stream_chat` holds the lock for the whole reply and checks the flag after every chunk.
+- `unload_model` sets the flag, waits up to 30 seconds for the reply to wind down, then calls the model's `close()` to release GPU/CPU buffers immediately. If the reply never lets go, the model is not freed underneath it (avoids a hard crash).
+- The interrupted reply ends with "Request failed: Stopped — the model was unloaded mid-reply." Text already streamed stays in the log; the half-finished turn is not saved to history, and a running Discussion ends.
+- Applies to every unload path (Models window, Disconnect, model swaps, auto-max-context reloads). The LM Studio backend is untouched — LM Studio owns its own process.
+- Known limit: during a very long prompt evaluation (before the first token), unload can take a few seconds to take effect.
+
+---
+
+### 15. Reasoning Controls
+- **Reasoning** (let the model think or not) and **Effort** (Low / Medium) — **Local backend**, now reached from the model chip menu under the input box (section 18) instead of a row in the Server card. Effort is greyed out while Reasoning is off. **High was removed** (see Bug Log).
+- **Show thinking** — hides or shows the muted "Thinking" block in the chat log. The model still thinks when hidden; the text just isn't displayed. The Drawing and Music windows have their own Show thinking boxes.
+- **Per-model behaviour** (detected from the model's own chat template):
+  - GPT-OSS (`reasoning_effort`) — uses the chosen level; unticking Reasoning drops it to Low, since it can't be fully switched off.
+  - Qwen3/3.5 (`enable_thinking`) — on/off only; level ignored. Off skips the thinking block entirely.
+  - Templates with neither switch ignore Reasoning and Effort.
+- **How it works** — `create_chat_completion` can't pass extra variables into a chat template, so when Reasoning is off or Effort isn't Medium the backend renders the template itself (llama-cpp-python's `Jinja2ChatFormatter` forwards extra kwargs), tokenizes the prompt with special tokens enabled, and calls `create_completion` with `max_tokens=None`. The default (Reasoning on, Medium) keeps the original chat path.
+- If rendering fails it falls back to the normal path silently — the first place to look if Reasoning/Effort seems to do nothing.
+- All settings are session-only.
+
+---
+
+### 16. HTTP API (Local Backend, Optional)
+Lets other local programs use the model **already loaded** in GGUFllama over plain HTTP. Built for the Block Editor, but generic. *(The Block Editor no longer needs it — see section 17 — so this is now mainly for external programs.)*
+
+- **Off by default.** Toggle from the title-bar right-click menu: **Start HTTP API (127.0.0.1:5178)** / **Stop HTTP API**. Starting logs "HTTP API listening on ..."; a taken port logs "Couldn't start the HTTP API: ..." instead of crashing. Session-only; `127.0.0.1` only.
+- **Local backend only.** Needs GGUFllama authenticated with a model loaded, otherwise HTTP 409 saying which step is missing. It never loads or unloads anything, so UI state can't drift from what's in VRAM.
+- **Which model:** the one the main chat is using, otherwise the first loaded Local model.
+- **Endpoints:** `GET /api/status` → `{loaded, model, path, ctx, busy}` (or `{loaded: false, reason, busy: false}`); `POST /api/chat` → body `{messages, schema?, temperature?, max_tokens?}` (defaults 0.2 / 2048), returns `{content, model}`.
+- **Structured output:** a `schema` constrains the reply to that JSON schema (`response_format: json_object`); if building the grammar fails it retries in plain JSON mode.
+- **Concurrency and cancel:** requests take the model's generation lock and queue behind a chat reply; the request streams internally so unloading cancels it (409 "Stopped — the model was unloaded").
+- **Live view (new):** each request is now shown live in the chat log — an "HTTP API request" header with an excerpt of the last user message, then the streamed "Thinking (HTTP API)" and "Assistant (HTTP API)" text in the normal chat styles.
+- Errors: 400 bad body, 404 unknown path, 409 not-connected / not-loaded / unloaded, 500 unexpected.
+- **Not applied to API requests:** Harmony filtering (section 13) and the Reasoning/Effort controls (section 15); the raw text is returned.
+- Stopping GGUFllama's Local connection doesn't stop the API server; use the menu toggle.
+
+---
+
+### 17. Block Editor — Now Built In  *(rebuilt and expanded)*
+Previously a separate Flask app (`block_editor.py`) that called GGUFllama over HTTP. It is now **part of `GGUFllama.py`**: describe a small Tkinter app in plain English, get a wired block graph, edit it visually in the browser, then generate, test-run and run the Tkinter code.
+
+- **Run:** title-bar right-click menu → **Open Block Editor** starts a Flask server on `127.0.0.1:5177` and opens the browser; **Stop Block Editor** appears in the same menu while it's running. Off by default, session-only. Needs `pip install flask` (imported lazily — the rest of the app runs fine without it).
+- **No HTTP API needed.** It calls the loaded Local model **in-process** (through the bridge's `chat` method), so turning on the HTTP API is no longer required. You still need to Authenticate and load a model; otherwise it tells you to. The separate `block_editor.py` and its settings dialog (API address) are effectively superseded.
+- **Block library (single source of truth): 16 blocks** in three categories; the editor, model schema, validator and code generator all read the same table.
+  - UI: Window, Button, Label, Entry, MessageBox.
+  - IO: HttpGet, ReadFile, WriteFile.
+  - Logic: Timer, If, Print, **Start** (fires once when the app opens), **JsonGet** (reads a dotted-path field from JSON), **TextTransform** (upper / lower / title / strip), **Join** (joins two texts with a separator), **Now** (current date/time via a strftime format).
+  - Port types: `ui` (Window `children` → widget `parent`), `flow` (triggers such as Button `click` → HttpGet `run`), `text` (data such as HttpGet `body` → Label `text`). An unwired text input falls back to the setting with the same name; all settings are strings. Triggers are auto-derived (blocks with a flow output but no flow input).
+  - Two built-in demos: a URL fetcher (Button → HttpGet → Label) and a live Clock (Timer → Now → Label).
+- **Ask flow:** the prompt goes to the model with a system prompt and JSON schema generated from the block library (so it can only emit known blocks/ports). **Up to 4 attempts** (was 3): each reply is auto-**repaired**, **validated**, and then — new — **test-run**; any errors or test failures are fed back to the model to correct.
+  - **Repair:** sanitizes/de-duplicates ids, drops unknown blocks, fills missing/invalid settings with defaults, keeps exactly one Window, flips backwards wires, drops mismatched/duplicate wires, auto-wires missing parents to the Window.
+  - **Validate:** known types, unique ids, exactly one Window, wires point at real blocks/ports, port types match, one wire per data input, every widget has its parent wired.
+  - **Auto-test (new):** the generated app is built in a test mode and run headless with network, file access and popups simulated (sample data), firing every trigger. It reports blocks that never run (nothing triggers their `run` input), syntax errors, runtime exceptions and the labels' resulting text. Only real failures go back to the model; "notes" the simulated data can't prove are shown but not fed back. Can be switched off per request; skipped with a message if Python isn't on PATH or no display is available (uses `xvfb-run` on Linux).
+- **Editor UI:** pannable/zoomable canvas, Auto-layout, click-to-select blocks/wires with a settings side panel, Delete/Backspace, block palette, Save/Load graph (JSON), Clear.
+- **Code generation:** every edit regenerates the Tkinter code live in a "Generated app.py" panel with **Copy**, **Save .py** and **Run**. Validation errors show above the code. Run writes the script to the temp folder and launches it with Python (needs Python on PATH even from a compiled .exe).
+- **Endpoints (internal):** `/api/library`, `/api/status`, `/api/generate`, `/api/test`, `/api/ask`, `/api/run`.
+
+---
+
+### 18. Model Chip Menu & UI Changes (Main Window)
+Model and reasoning settings moved out of the Server card into a **chip at the bottom-right of the input box** that reads `<model>  <effort> ▾` (effort shows "Off" when Reasoning is off). Clicking it pops up a menu (rebuilt fresh each time):
+
+- The active model with a ✓ (or "Not connected" / "No model loaded"), an **Effort** submenu (Low / Medium; disabled when Reasoning is off), and a **More models** submenu listing the catalog largest-first with ✓ on loaded ones — picking one loads it (or switches chat to it) through the Models window's own loader, so eviction, context, spillover and Discussion protection behave exactly like double-clicking there.
+- **Reasoning**, **Show thinking**, **Auto-max context for all models**, **Allow RAM spillover (Local)**, **GPU layers: Auto/N…** (opens a slider dialog; only enabled with spillover on), and **Manage models…** (opens the Models window).
+- The Server card is now just the status dot/label and the Authenticate button, plus the persona row (section 19) and the **"Unload model after each reply"** checkbox (**on by default**).
+- Title-bar right-click menu is now: Save Locations, Local Models Folder, Start/Stop HTTP API, then Drawing, Music, Images (SD 1.5), Open/Stop Block Editor.
+
+---
+
+### 19. Terminator Persona + Lore Grounding, and Speech
+A fun, deliberately constrained roleplay mode on the Constraints card: a **Terminator persona** checkbox, a **Speak** checkbox and a **Lore file…** button with a status label.
+
+- **Three separated layers:** (1) **Persona** — fixed text making the model a reprogrammed T-800 protecting John Connor: calm, literal, mission-style, under ~100 words, ending with a varied `STATUS:` line; (2) **Lore** — what it may claim about the Terminator universe, read from a bible file (`Terminator_Lore_Bible_v2.md` or `Terminator.txt` next to the script, or chosen via Lore file…); (3) **Engine** — the normal llama.cpp backend.
+- **Retrieval:** the whole bible is too big for a 4096-token context, so each turn only the sections matching your message are pulled in (keyword match with stopwords removed, ~3,200-character budget ≈ 800 tokens).
+- **Tag discipline:** claims must carry the reference's tags — `[LORE]`, `[ESTABLISHED]`, `[INFERENCE]`, `[UNKNOWN]`, `[CONFLICT]`, `[EXTENDED]`, `[T3]`. A `[LORE]` claim must be nearly a copy of a reference line; otherwise the answer is `[UNKNOWN]` and it stops. `[INVENTED]` speculation only when explicitly asked. Never upgrades `[INFERENCE]` to `[LORE]`.
+- **How it's injected:** the persona + lore are folded into the **last user message** each turn (not a separate system message) and rebuilt every turn, never stored in `conversation`. Only the last 4 chat messages are sent in persona mode, since the lore is re-injected anyway. Chat mode only.
+- **Speak:** reads replies aloud with Windows' built-in System.Speech through PowerShell (no extra packages) using SSML — male voice, `x-low` pitch, `slow` rate — text piped over stdin with `-EncodedCommand` so quotes can't break it. Only natural-language text is spoken (tags, markdown and HUD punctuation stripped). Turning it on says "Voice online."; refused with a message if speech isn't available (non-Windows). New Chat / unticking stops speech.
+- Session-only, like the other settings.
+
+---
+
+### 20. Drawing (Built-In Window)
+Title-bar menu → **Drawing**. Watch the loaded model draw.
+
+- The model writes one SVG (system prompt: viewBox 0 0 800 600, back-to-front painting, one element per line, plain colours, limited element set — rect, circle, ellipse, line, polyline, polygon, path, text, g with transform, linearGradient). `SvgLiveRenderer` parses it **while it streams** and paints each shape the moment it's complete, so the picture builds stroke by stroke. It includes its own path flattening (all M/L/H/V/C/S/Q/T/A/Z commands) and transform-matrix handling.
+- **Follow-ups** ("make the sky darker") send the current drawing back for a rewrite. **Draw** / **Stop** buttons, a **Show thinking** box with a muted thinking panel, and a status line. Uses the already-loaded Local model; nothing to install.
+
+---
+
+### 21. Music (Built-In Window)
+Title-bar menu → **Music**. The loaded model composes; you watch notes appear and press Play.
+
+- The model writes a small JSON score (`tempo` + 2-4 `tracks` of notes: pitch name, start beat, length, volume; waves sine/square/triangle/saw or a drums track of kick/snare/hat/tom; 4/4, 8-16 bars, ≤160 notes). `parse_music()` reads it as it streams and the **piano roll fills in note by note** (per-track colours).
+- A tiny pure-Python synthesizer renders a WAV (sine/square/triangle/saw + noise drums) that plays through `winsound` on Windows (`afplay`/`aplay`/`paplay` elsewhere). **Compose**, **Stop**, **▶ Play / ■ Stop**, **New**, **Save MIDI…**, **Save WAV…**. Follow-ups ("slower, add a bass line") rewrite the score. Status reports note count, duration and bpm. Show thinking box included. Nothing to install.
+
+---
+
+### 22. Image Generation — Images (SD 1.5)
+Title-bar menu → **Images (SD 1.5)**. Runs the prebuilt **stable-diffusion.cpp** (`sd-cli.exe` / `sd.exe`) as a **subprocess**, so nothing is loaded into the app's own process (can't clash with llama.cpp's ggml, and killing it frees VRAM instantly).
+
+- You pick the exe and an SD 1.5 checkpoint (session-only), then write a prompt and optional negative prompt. Controls: Width/Height (384-768), Steps (default 20), CFG (7.0), Seed (-1 = random), Sampler (euler_a, euler, dpm++2m, heun, lcm). **Save As…** copies the result out.
+- **VRAM warning:** the SD process can't see the LLM's VRAM, so before generating it checks the VRAM tally; if a Local model is loaded and under ~4,000 MB looks free it warns and suggests unloading in the Models window first.
+
+---
+
+## Development Backlog (Not Yet Built)
+- The 7 role prompts from the Prompts window are still not wired into Chat or Discussion — Discussion runs as a raw two-model conversation. (The Terminator persona is a separate, Chat-mode-only system.)
+- The Constraints Engine still isn't integrated into the reply validation pipeline — `_stream_finish()` bypasses constraints.
+- The Save Locations helper is only consumed by Notes → Save so far. (Drawing/Music/Images use their own Save dialogs; Local Models Folder is a standalone setting.)
+- Reasoning/Effort apply to the Local backend only and aren't used by the HTTP API, Drawing or Music requests.
+- Temperature is still fixed at 0.7 in the chat UI; no UI control yet. (The HTTP API and Block Editor take their own.)
+- The HTTP API is Local-only, no auth (localhost only), and can't load a model itself.
+- Block Editor: 16 blocks, Tkinter output only; the old standalone `block_editor.py` and its settings dialog are superseded and could be retired.
+- With LM Studio removed, models in quantization formats the pinned llama-cpp-python can't read (e.g. MXFP4) have no fallback path in this app; the Models window banner still mentions LM Studio as a workaround.
+- Persona mode is Chat-only (not Discussion) and depends on a lore file sitting beside the script or chosen manually.
+- Housekeeping: a stale "GGUFmanager.py" mention remains in a Constraint Engine comment; Section 1-10 above still describe LM Studio-era behaviour as history.
+
+---
+
+## Bug Log
+Paste bug explanations that break the script here for future reference:
+- Tried redirecting stdout/stderr file descriptors (`os.dup2`) around the `Llama()` load call in `LocalLlamaBackend`, to stream llama.cpp's load-time console output into the chat log live — this broke the app, so it was removed and reverted.
+- `create_completion` silently caps output at 16 tokens by default (unlike `create_chat_completion`). The first version of the reasoning controls hit this: replies were cut off after a sentence or two of thinking, and with Show thinking off the reply looked empty, after which auto-unload fired "Model unloaded.". Fixed by passing `max_tokens=None` on the custom-prompt path.
+- Unloading a Local model mid-reply didn't stop generation — the reply thread's own reference kept the model alive and generating. Fixed with the cancel flag + generation lock described in section 14.
+- High reasoning level caused cutoff/broken replies on GPT-OSS — suspected Jinja2 render failure or context exhaustion from excessive thinking tokens. Removed from the Effort menu; Low and Medium only.
+
+---
